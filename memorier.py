@@ -336,7 +336,6 @@ class Memorier:
         print("\nCreated folders successfully!")
 
     def organizeMemories(self):
-        ask = input("Press any key to continue...")
         moved_count = 0
         with tqdm(total=len(self.founded_paths), desc="Copying files", unit="file") as pbar:
             for file_path in self.founded_paths:
@@ -369,7 +368,7 @@ class Memorier:
         
         print(f"\nSuccessfully copied {moved_count} files into Memories folder!")
 
-memorier = Memorier("C:\\Users\\nagin\\OneDrive\\Belgeler\\memories")
+memorier = Memorier("C:\\Users\\you\\path\\to\\your\\media")
 if memorier.validateFiles():
     memorier.collectFiles()
     memorier.removeLargeFiles()
