@@ -1,328 +1,183 @@
-import os
-import re
-import cv2
-import json
-import shutil
-import hashlib
 import warnings
-import subprocess
 from tqdm import tqdm
-from PIL import Image
-from mutagen.mp4 import MP4
-from datetime import datetime
-from PIL.ExifTags import TAGS
-from contextlib import contextmanager
+from converter import place_file
+from classifier import classify_images
+from dates import find_date, parse_date
+from paths import index_file, memories_dir, output_dir
+from mediainfo import frame_hashes, probe_video, read_image
+from useless import is_garbage, is_screen_size, name_reason, quality_reason
+from config import MEDIA_EXTS, MIN_IMAGE_SIDE, MIN_VIDEO_SECONDS, REVIEW_NO_CAMERA, VIDEO_EXTS
+from duplicates import (cached_hash, group_pairs, image_pairs, load_index, save_index,
+                        similar_pairs, video_pairs)
 
-Image.MAX_IMAGE_PIXELS = None
 warnings.filterwarnings("ignore")
 
-@contextmanager
-def suppressStderr():
-    devnull = open(os.devnull, 'w')
-    oldFd = os.dup(2)
-    os.dup2(devnull.fileno(), 2)
-    try:
-        yield
-    finally:
-        os.dup2(oldFd, 2)
-        os.close(oldFd)
-        devnull.close()
+def quality_rank(memory):
+    has_date = any(parse_date(text) for text in memory["dates"])
+    pixels = (memory["width"] or 0) * (memory["height"] or 0)
+    return memory["camera"], has_date, pixels, memory["path"].stat().st_size
 
 class Memorier:
-    imageExtensions = {'.jpg', '.jpeg', '.png', '.heic', '.webp'}
-    videoExtensions = {'.mp4', '.avi', '.mkv', '.mov', '.webm'}
-    allExtensions = imageExtensions | videoExtensions
-
-    def __init__(self, memoriesFolder: str, outputFolder: str):
-        self.memoriesFolder = memoriesFolder
-        self.outputFolder = outputFolder
+    def __init__(self, memories_dir, output_dir, index_file):
+        self.memories_dir = memories_dir
+        self.output_dir = output_dir
+        self.index_file = index_file
+        self.index = load_index(index_file)
         self.memories = []
+        self.run_hashes = set()
 
-    def findFiles(self):
-        allFiles = []
-        for root, _, files in os.walk(self.memoriesFolder):
-            for file in files:
-                allFiles.append(os.path.join(root, file))
-
-        matchingFiles = []
-        for filePath in tqdm(allFiles, desc="Finding files"):
-            if os.path.splitext(filePath)[1].lower() in self.allExtensions:
-                matchingFiles.append(filePath)
-        self.memories = matchingFiles
+    def find_files(self):
+        all_files = [path for path in self.memories_dir.rglob("*") if path.is_file()]
+        self.memories = []
+        for path in tqdm(all_files, desc="Finding files"):
+            suffix = path.suffix.lower()
+            if suffix in MEDIA_EXTS and self.output_dir not in path.parents:
+                self.memories.append({"path": path, "video": suffix in VIDEO_EXTS, "review": None})
         print(f"Found {len(self.memories)} files.\n")
 
-    def convertToJPG(self, inputPath: str):
-        outputPath = os.path.splitext(inputPath)[0] + ".jpg"
-        subprocess.run(["ffmpeg", "-i", inputPath, outputPath], capture_output=True)
-        return outputPath
-
-    def convertHeicFiles(self):
-        heicMemories = [f for f in self.memories if os.path.splitext(f)[1].lower() == ".heic"]
-        convertedCount = 0
-        for heicMemory in tqdm(heicMemories, desc="Converting HEIC to JPG"):
-            outputPath = self.convertToJPG(heicMemory)
-            if os.path.exists(outputPath):
-                self.memories.append(outputPath)
-                self.memories.remove(heicMemory)
-                convertedCount += 1
-        print(f"Converted {convertedCount} HEIC files.\n")
-
-    def removeGarbageFiles(self):
-        keywords = {"trash", "stk", "tmp", "temp", "cache"}
-        cleanMemories = []
-        garbageCount = 0
+    def remove_garbage_files(self):
+        clean_memories = []
         for memory in tqdm(self.memories, desc="Removing garbage files"):
-            nameWithoutExt = os.path.splitext(os.path.basename(memory))[0].lower()
-            if any(kw in nameWithoutExt for kw in keywords) or len(nameWithoutExt) > 19:
-                garbageCount += 1
+            memory["review"] = name_reason(memory["path"])
+            if memory["review"] or not is_garbage(memory["path"]):
+                clean_memories.append(memory)
+        print(f"Removed {len(self.memories) - len(clean_memories)} garbage files.\n")
+        self.memories = clean_memories
+
+    def remove_exact_duplicates(self):
+        unique_memories = {}
+        for memory in tqdm(self.memories, desc="Hashing files"):
+            memory["md5"] = cached_hash(self.index, memory["path"])
+            self.run_hashes.add(memory["md5"])
+            if memory["md5"] not in self.index["done"]:
+                unique_memories.setdefault(memory["md5"], memory)
+        print(f"Skipped {len(self.memories) - len(unique_memories)} exact or old copies.\n")
+        self.memories = list(unique_memories.values())
+
+    def read_media(self):
+        readable_memories = []
+        for memory in tqdm(self.memories, desc="Reading files"):
+            details = probe_video(memory["path"]) if memory["video"] else read_image(memory["path"])
+            if details is not None:
+                memory.update(details)
+                readable_memories.append(memory)
+        print(f"Removed {len(self.memories) - len(readable_memories)} corrupted files.\n")
+        self.memories = readable_memories
+
+    def filter_by_dimensions(self):
+        high_res_memories = []
+        for memory in self.memories:
+            if not memory["review"] and is_screen_size(memory):
+                memory["review"] = "screenshots"
+            width, height = memory["width"], memory["height"]
+            low_res = width and height and min(width, height) < MIN_IMAGE_SIDE
+            if memory["review"] or not low_res:
+                high_res_memories.append(memory)
+        print(f"Removed {len(self.memories) - len(high_res_memories)} low resolution files.\n")
+        self.memories = high_res_memories
+
+    def filter_by_duration(self):
+        valid_memories = []
+        for memory in self.memories:
+            duration = memory.get("duration")
+            too_short = memory["video"] and duration is not None and duration < MIN_VIDEO_SECONDS
+            if memory["review"] or not too_short:
+                valid_memories.append(memory)
+        print(f"Removed {len(self.memories) - len(valid_memories)} short videos.\n")
+        self.memories = valid_memories
+
+    def find_near_copies(self, memories, old_values, new_values, find_pairs):
+        offset = len(old_values)
+        copies = set()
+        for group in group_pairs(offset + len(new_values), find_pairs(old_values + new_values)):
+            members = [memories[i - offset] for i in group if i >= offset]
+            if len(group) > 1 and members:
+                best = max(members, key=quality_rank) if len(members) == len(group) else None
+                copies.update(memory["md5"] for memory in members if memory is not best)
+        return copies
+
+    def remove_near_duplicates(self):
+        images = [m for m in self.memories if not m["video"] and not m["review"]]
+        videos = [m for m in self.memories if m["video"] and not m["review"]]
+
+        for video in tqdm(videos, desc="Reading video frames"):
+            video["frames"] = frame_hashes(video["path"], video["duration"] or 0)
+
+        image_values = [image["phash"] for image in images]
+        video_values = [[video["duration"] or 0, video["frames"]] for video in videos]
+        copies = self.find_near_copies(images, self.index["images"], image_values, image_pairs)
+        copies |= self.find_near_copies(videos, self.index["videos"], video_values, video_pairs)
+
+        print(f"Removed {len(copies)} near duplicate files.\n")
+        self.memories = [memory for memory in self.memories if memory["md5"] not in copies]
+
+    def find_useless_images(self):
+        images = [memory for memory in self.memories if not memory["video"]]
+        for image in images:
+            image["review"] = image["review"] or quality_reason(image)
+
+        candidates = [image for image in images if not image["review"]]
+        if not candidates:
+            return
+
+        reasons, embeddings = classify_images([image["path"] for image in candidates])
+        for image, reason in zip(candidates, reasons):
+            no_camera = REVIEW_NO_CAMERA and not image["camera"]
+            image["review"] = reason or ("no-camera" if no_camera else None)
+
+        kept = [i for i, image in enumerate(candidates) if not image["review"]]
+        for group in group_pairs(len(kept), similar_pairs(embeddings[kept])):
+            members = [candidates[kept[i]] for i in group]
+            best = max(members, key=quality_rank)
+            for image in members:
+                if image is not best:
+                    image["review"] = "similar"
+
+        review_count = sum(1 for image in images if image["review"])
+        print(f"Sent {review_count} images to Review.\n")
+
+    def destination_folder(self, memory):
+        base = self.output_dir / ("Videos" if memory["video"] else "Photos")
+        if memory["review"]:
+            base = self.output_dir / "Review" / memory["review"]
+        date = find_date(memory["path"], memory["dates"])
+        if date is None:
+            return base / "Unknown"
+        return base / date.strftime("%Y") / date.strftime("%m-%B")
+
+    def organize_files(self):
+        total_copied = 0
+        total_skipped = 0
+
+        for memory in tqdm(self.memories, desc="Copying files"):
+            if place_file(memory["path"], self.destination_folder(memory), memory["md5"]):
+                total_copied += 1
             else:
-                cleanMemories.append(memory)
-        self.memories = cleanMemories
-        print(f"Removed {garbageCount} garbage files.\n")
+                total_skipped += 1
 
-    def checkCorruptedFiles(self):
-        validMemories = []
-        corruptedCount = 0
-        for memory in tqdm(self.memories, desc="Checking for corrupted files"):
-            ext = os.path.splitext(memory)[1].lower()
-            if ext in self.imageExtensions:
-                try:
-                    img = Image.open(memory)
-                    img.verify()
-                    validMemories.append(memory)
-                except Exception:
-                    corruptedCount += 1
-            else:
-                validMemories.append(memory)
-        self.memories = validMemories
-        print(f"Removed {corruptedCount} corrupted files.\n")
+            self.index["done"][memory["md5"]] = True
+            if memory["video"] and not memory["review"]:
+                self.index["videos"].append([memory["duration"] or 0, memory["frames"]])
+            elif not memory["review"]:
+                self.index["images"].append(memory["phash"])
 
-    def convertWebpFiles(self):
-        webpMemories = [f for f in self.memories if os.path.splitext(f)[1].lower() == ".webp"]
-        convertedCount = 0
-        for webpMemory in tqdm(webpMemories, desc="Converting WebP to JPG"):
-            outputPath = self.convertToJPG(webpMemory)
-            if os.path.exists(outputPath):
-                self.memories.append(outputPath)
-                self.memories.remove(webpMemory)
-                convertedCount += 1
-        print(f"Converted {convertedCount} WebP files.\n")
-
-    def convertToMp4(self, inputPath: str):
-        outputPath = os.path.splitext(inputPath)[0] + ".mp4"
-        subprocess.run(["ffmpeg", "-i", inputPath, "-c:v", "libx264", "-c:a", "aac", outputPath], capture_output=True)
-        return outputPath
-
-    def convertVideoFiles(self):
-        videoMemories = [f for f in self.memories if os.path.splitext(f)[1].lower() in {".avi", ".mkv", ".mov", ".webm"}]
-        convertedCount = 0
-        for videoMemory in tqdm(videoMemories, desc="Converting videos to MP4"):
-            outputPath = self.convertToMp4(videoMemory)
-            if os.path.exists(outputPath):
-                self.memories.append(outputPath)
-                self.memories.remove(videoMemory)
-                convertedCount += 1
-        print(f"Converted {convertedCount} video files.\n")
-
-    def getDimensions(self, filePath: str):
-        ext = filePath.rsplit(".", 1)[-1].lower()
-        if ext in ("jpg", "jpeg", "png"):
-            img = Image.open(filePath)
-            return img.size
-        elif ext == "mp4":
-            with suppressStderr():
-                cap = cv2.VideoCapture(filePath)
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
-            return w, h
-        return None, None
-
-    def filterByDimensions(self):
-        highResMemories = []
-        countLowResFiles = 0
-        for memory in tqdm(self.memories, desc="Getting dimensions of files"):
-            width, height = self.getDimensions(memory)
-            if width is None or height is None:
-                highResMemories.append(memory)
-            elif height < 720 or width < 720:
-                countLowResFiles += 1
-            else:
-                highResMemories.append(memory)
-        self.memories = highResMemories
-        print(f"Removed {countLowResFiles} low resolution files.\n")
-
-    def imageHash(self, path: str):
-        img = Image.open(path).convert("RGB").resize((32, 32))
-        return hashlib.md5(img.tobytes()).hexdigest()
-
-    def videoHash(self, path: str):
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            h.update(f.read())
-        return h.hexdigest()
-
-    def removeDuplicates(self):
-        seenImages = {}
-        seenVideos = {}
-        result = []
-
-        for file in tqdm(self.memories, desc="Removing duplicates"):
-            ext = file.split(".")[-1].lower()
-            if ext in ["jpg", "jpeg", "png"]:
-                h = self.imageHash(file)
-                if h in seenImages:
-                    old = seenImages[h]
-                    if old.endswith((".jpg", ".jpeg")) and ext == "png":
-                        result[result.index(old)] = file
-                        seenImages[h] = file
-                else:
-                    seenImages[h] = file
-                    result.append(file)
-            elif ext == "mp4":
-                h = self.videoHash(file)
-                if h not in seenVideos:
-                    seenVideos[h] = file
-                    result.append(file)
-
-        print(f"Removed {len(self.memories) - len(result)} duplicate files.\n")
-        self.memories = result
-
-    def getDuration(self, videoPath: str):
-        try:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", videoPath]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return float(json.loads(result.stdout)["format"]["duration"])
-        except Exception:
-            return None
-
-    def filterByDuration(self):
-        validMemories = []
-        removedCount = 0
-        for memory in tqdm(self.memories, desc="Filtering videos by duration"):
-            if memory.endswith(".mp4"):
-                duration = self.getDuration(memory)
-                if duration is not None and (duration < 3 or duration > 180):
-                    removedCount += 1
-                    continue
-            validMemories.append(memory)
-        self.memories = validMemories
-        print(f"Removed {removedCount} videos (duration < 3s or > 180s).\n")
-
-    def getTakenDate(self, filePath: str):  
-        ext = os.path.splitext(filePath)[1].lower()
-
-        if ext in ('.jpg', '.jpeg'):
-            exifData = getattr(Image.open(filePath), '_getexif', lambda: None)()
-            if exifData:
-                for tag, value in exifData.items():
-                    if TAGS.get(tag) == 'DateTimeOriginal':
-                        return datetime.strptime(value, '%Y:%m:%d %H:%M:%S').strftime('%B %Y')
-
-        elif ext == '.png':
-            img = Image.open(filePath)
-            xmp = img.info.get('XML:com.adobe.xmp', '')
-            if xmp:
-                match = re.search(r'<exif:DateTimeOriginal>(.*?)</exif:DateTimeOriginal>', xmp)
-                if match:
-                    try:
-                        return datetime.fromisoformat(match.group(1)[:10]).strftime('%B %Y')
-                    except Exception:
-                        pass
-
-        elif ext == '.mp4':
-            tags = MP4(filePath).tags
-            if tags:
-                for key in ('©day', 'date', 'DATE'):
-                    if key in tags:
-                        try:
-                            return datetime.fromisoformat(tags[key][0][:10]).strftime('%B %Y')
-                        except Exception:
-                            pass
-            try:
-                cmd = ["ffprobe", "-v", "error", "-show_entries", "format_tags=creation_time",
-                       "-of", "json", filePath]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                creationTime = json.loads(result.stdout)["format"]["tags"]["creation_time"]
-                return datetime.fromisoformat(creationTime[:10]).strftime('%B %Y')
-            except Exception:
-                pass
-
-        return None
-
-    def buildFolderStructure(self):
-        self.folderStructure = {"Photos": {}, "Videos": {}}
-        datedCount = 0
-        unknownCount = 0
-
-        for memory in tqdm(self.memories, desc="Getting file dates"):
-            date = self.getTakenDate(memory)
-            goesTo = "Videos" if str(memory).lower().endswith(".mp4") else "Photos"
-
-            if date is not None:
-                month, year = date.split()
-                if year not in self.folderStructure[goesTo]:
-                    self.folderStructure[goesTo][year] = {}
-                if month not in self.folderStructure[goesTo][year]:
-                    self.folderStructure[goesTo][year][month] = []
-                self.folderStructure[goesTo][year][month].append(memory)
-                datedCount += 1
-            else:
-                if "Unknown" not in self.folderStructure[goesTo]:
-                    self.folderStructure[goesTo]["Unknown"] = []
-                self.folderStructure[goesTo]["Unknown"].append(memory)
-                unknownCount += 1
-
-        print(f"Dated {datedCount} files, {unknownCount} without date.\n")
-
-    def organizeFiles(self):
-        outputRoot = self.outputFolder
-        copyTasks = []
-
-        for mediaType, years in self.folderStructure.items():
-            for yearOrUnknown, value in years.items():
-                if yearOrUnknown == "Unknown":
-                    destFolder = os.path.join(outputRoot, mediaType, "Unknown")
-                    os.makedirs(destFolder, exist_ok=True)
-                    for filePath in value:
-                        destFile = os.path.join(destFolder, os.path.basename(filePath))
-                        copyTasks.append((filePath, destFile))
-                else:
-                    for month, files in value.items():
-                        destFolder = os.path.join(outputRoot, mediaType, yearOrUnknown, month)
-                        os.makedirs(destFolder, exist_ok=True)
-                        for filePath in files:
-                            destFile = os.path.join(destFolder, os.path.basename(filePath))
-                            copyTasks.append((filePath, destFile))
-
-        totalCopied = 0
-        totalSkipped = 0
-
-        for filePath, destFile in tqdm(copyTasks, desc="Copying files"):
-            if not os.path.exists(destFile):
-                shutil.copy2(filePath, destFile)
-                totalCopied += 1
-            else:
-                totalSkipped += 1
-
-        print(f"Copied {totalCopied} files, skipped {totalSkipped} existing files.\n")
+        print(f"Copied {total_copied} files, skipped {total_skipped} existing files.\n")
 
     def run(self):
-        self.findFiles()
-        self.convertHeicFiles()
-        self.removeGarbageFiles()
-        self.checkCorruptedFiles()
-        self.convertWebpFiles()
-        self.convertVideoFiles()
-        self.filterByDimensions()
-        self.removeDuplicates()
-        self.filterByDuration()
-        self.buildFolderStructure()
-        self.organizeFiles()
+        try:
+            self.find_files()
+            self.remove_garbage_files()
+            self.remove_exact_duplicates()
+            self.read_media()
+            self.filter_by_dimensions()
+            self.filter_by_duration()
+            self.remove_near_duplicates()
+            self.find_useless_images()
+            self.organize_files()
+            self.index["done"].update(dict.fromkeys(self.run_hashes, True))
+        finally:
+            save_index(self.index, self.index_file)
 
 if __name__ == "__main__":
-    memorier = Memorier(
-        memoriesFolder="path\to\your\folder", # where the mixed files are in 
-        outputFolder="path\to\your\folder" # where the organized files will be saved
-    )
+    memorier = Memorier(memories_dir, output_dir, index_file)
     memorier.run()

@@ -1,6 +1,0 @@
-pillow
-tqdm
-opencv-python
-mutagen
-pure-python-adb
-pyftpdlib
