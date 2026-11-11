@@ -1,4 +1,5 @@
 import socket
+from paths import share_dir
 from pyftpdlib.servers import FTPServer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.authorizers import DummyAuthorizer
@@ -6,7 +7,6 @@ from pyftpdlib.authorizers import DummyAuthorizer
 PORT = 2121
 USERNAME = "memorier"
 PASSWORD = "memorier2026"
-USB_PATH = "path\to\your\folder"
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -16,7 +16,7 @@ def get_local_ip():
     return ip
 
 authorizer = DummyAuthorizer()
-authorizer.add_user(USERNAME, PASSWORD, USB_PATH, perm="elradfmwMT")
+authorizer.add_user(USERNAME, PASSWORD, str(share_dir), perm="elradfmwMT")
 
 handler = FTPHandler
 handler.authorizer = authorizer
@@ -30,6 +30,6 @@ print(f"📌 Host:     {ip}")
 print(f"📌 Port:     {PORT}")
 print(f"📌 Username: {USERNAME}")
 print(f"📌 Password: {PASSWORD}")
-print(f"📂 Serving:  {USB_PATH}")
+print(f"📂 Serving:  {share_dir}")
 
 server.serve_forever()

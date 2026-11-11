@@ -1,0 +1,24 @@
+[project]
+name = "memorier"
+version = "0.1.0"
+description = "Clean, sort and organize photos and videos"
+requires-python = ">=3.10.18"
+dependencies = [
+    "imagehash>=4.3.2",
+    "numpy>=2",
+    "pillow>=12.3.0",
+    "pillow-heif>=1.8.1",
+    "pure-python-adb>=0.3.0.dev0",
+    "pyftpdlib>=2.2.0",
+    "torch>=2.14.1",
+    "tqdm>=4.70.1",
+    "transformers>=5.20.2",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
